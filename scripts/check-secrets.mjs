@@ -223,7 +223,7 @@ function words(name) {
 }
 
 // Only names for a *reusable* credential, so the sensitive-assignment rule
-// fires on `API_KEY=…` but not on `x-moad-signature: …` (a per-request HMAC,
+// fires on `API_KEY=…` but not on `x-app-signature: …` (a per-request HMAC,
 // derived from a secret that isn't itself present) or a session/cookie value.
 // Those are handled — where they are handled — by the header and URL rules.
 const CREDENTIAL_WORDS = new Set([
@@ -436,7 +436,7 @@ const RULES = [
 		// A presigned URL's signature is exempt by name, not by dropping
 		// `signature` from the rule: it is a per-request HMAC derived from a key
 		// that isn't in the URL, the same reason CREDENTIAL_WORDS leaves
-		// `x-moad-signature` out, while a `?signature=` on some other callback
+		// `x-app-signature` out, while a `?signature=` on some other callback
 		// URL has no such guarantee and is still reported. The reusable half of
 		// a presigned URL is caught either way — X-Amz-Credential carries the
 		// access key id, which aws-access-key-id matches on its own.
