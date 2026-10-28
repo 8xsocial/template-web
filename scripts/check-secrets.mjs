@@ -274,6 +274,40 @@ function looksLikeSecretValue(value) {
 
 const RULES = [
 	{
+		// A kilobyte-plus base64 run in a transcript is a file, not a value: an
+		// Android signing keystore inlined in a build error, say. A signing
+		// identity cannot be rotated, so this is the most expensive shape to miss. Threshold is high enough to ignore an inline
+		// icon or a scraped page's assets.
+		id: 'large-base64-blob',
+		description: 'a large base64 blob (an inlined keystore, certificate or key file)',
+		regex: /\b[A-Za-z0-9+/]{1000,}={0,2}/g
+	},
+	{
+		// A PostHog project/personal key. `phc_` ships to the browser, but a
+		// transcript quoting one usually quotes `phx_`/the personal token beside
+		// it, so both shapes turn up in session logs.
+		id: 'posthog-key',
+		description: 'a PostHog API key',
+		regex: /\bph[cx]_[A-Za-z0-9]{30,}\b/g,
+		validate: (secret) => !isPlaceholderValue(secret)
+	},
+	{
+		// RapidAPI keys are a hex blob with a literal `jsn` in the middle.
+		id: 'rapidapi-key',
+		description: 'a RapidAPI key',
+		regex: /\b[0-9a-f]{20,60}jsn[0-9a-f]{8,}\b/g
+	},
+	{
+		// A dev sign-in bypass passed as `?dev=<secret>`, and magic links arrive
+		// as `?token=`/`?otp=`. The generic sensitive-query-param rule keys on
+		// key/token/secret/... and so misses `dev`, `otp` and `magic`.
+		id: 'auth-query-param',
+		description: 'a credential in a dev / otp / magic-link query parameter',
+		regex: /[?&][\w.-]*(?:otp|magic|dev|session|bearer)[\w.-]*=([^&\s"'`]+)/gi,
+		group: 1,
+		validate: (value) => isLiveSecret(value, { minEntropy: 3.0 })
+	},
+	{
 		id: 'private-key',
 		description: 'a PEM private-key block',
 		regex: /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----/g
@@ -485,7 +519,10 @@ export function run({ mode, paths = [] }) {
 	const findings = []
 	for (const [path, text] of collect(mode, paths)) {
 		if (text == null || isSkipped(path, allowlist)) continue
-		if (text.length > MAX_BYTES || isProbablyBinary(text)) continue
+		// Session transcripts are routinely over 1MB and are exactly where a
+		// credential lands, so the generated-bundle size cap does not apply to them.
+		const isTranscript = /(^|\/)\.(claude|codex)-logs\//.test(path)
+		if ((!isTranscript && text.length > MAX_BYTES) || isProbablyBinary(text)) continue
 		for (const finding of scanText(text)) findings.push({ path, ...finding })
 	}
 	return findings
