@@ -253,6 +253,59 @@ function isLiveSecret(value, { minLen = 12, minEntropy = 3.6 } = {}) {
 	return shannon(value) >= minEntropy
 }
 
+// An object key is not a credential, even in a sensitively named slot:
+// `videoObjectKey = 'post-videos/clips/123.mp4'` is public storage addressing.
+// The exemption is read off the FIELD, not off the value, because every
+// value-shape test for "this is a path" loses to a key chopped into
+// path-shaped pieces — `uploads/aBcDeFgHi1/JkLmNoPq2/x.mp4` defeats any
+// segment-length cutoff you pick. A field says what it is for: `API_KEY` never
+// gets the exemption however its value is spelled, and the failure mode of a
+// storage field this list has not heard of yet (`clipUri`, say) is a finding
+// one `allowlist secret` away, which is the safe direction to fail in.
+const STORAGE_FIELD_WORDS = new Set([
+	'asset',
+	'attachment',
+	'avatar',
+	'bucket',
+	'clip',
+	'document',
+	'file',
+	'filename',
+	'image',
+	'media',
+	'object',
+	'path',
+	'photo',
+	'prefix',
+	'thumbnail',
+	'upload',
+	'uri',
+	'url',
+	'video'
+])
+
+// `key` is the one credential word a storage field may carry: `objectKey`,
+// `fileKey` and `videoKey` are storage parlance, and that ambiguity is what the
+// exemption exists to tolerate. Nobody calls a storage path a secret, a token
+// or a password, so a field carrying one of those keeps its entropy check
+// however many storage words sit beside it — `secretVideoUrl` holding a
+// capability URL is a credential, and the path it is shaped like is the point.
+const STORAGE_AMBIGUOUS_CREDENTIAL_WORDS = new Set(['key', 'apikey'])
+
+function isStorageField(name) {
+	const parts = words(name)
+	if (!parts.some((word) => STORAGE_FIELD_WORDS.has(word))) return false
+	return parts.every(
+		(word) => !CREDENTIAL_WORDS.has(word) || STORAGE_AMBIGUOUS_CREDENTIAL_WORDS.has(word)
+	)
+}
+
+// A path with a file extension, spelled the way an extension is spelled
+// (lowercase, letter-led) so a base64 tail like `.aB12` does not qualify.
+function isObjectKeyPath(value) {
+	return value.includes('/') && /\.[a-z][a-z0-9]{1,4}$/.test(value)
+}
+
 function looksLikeSecretValue(value) {
 	if (!/^[A-Za-z0-9._+/=~-]{20,}$/.test(value)) return false
 	// Supabase's publishable key is public by design (it ships in the browser
@@ -272,7 +325,43 @@ function looksLikeSecretValue(value) {
 // live credential or an allowlisted placeholder.
 // ---------------------------------------------------------------------------
 
+const PRESIGNED_SIGNATURE_PARAM = /[?&]x-(?:amz|goog)-signature=/i
+
 const RULES = [
+	{
+		// A kilobyte-plus base64 run in a transcript is a file, not a value: an
+		// Android signing keystore inlined in a build error, say. A signing
+		// identity cannot be rotated, so this is the most expensive shape to miss. Threshold is high enough to ignore an inline
+		// icon or a scraped page's assets.
+		id: 'large-base64-blob',
+		description: 'a large base64 blob (an inlined keystore, certificate or key file)',
+		regex: /\b[A-Za-z0-9+/]{1000,}={0,2}/g
+	},
+	{
+		// A PostHog project/personal key. `phc_` ships to the browser, but a
+		// transcript quoting one usually quotes `phx_`/the personal token beside
+		// it, so both shapes turn up in session logs.
+		id: 'posthog-key',
+		description: 'a PostHog API key',
+		regex: /\bph[cx]_[A-Za-z0-9]{30,}\b/g,
+		validate: (secret) => !isPlaceholderValue(secret)
+	},
+	{
+		// RapidAPI keys are a hex blob with a literal `jsn` in the middle.
+		id: 'rapidapi-key',
+		description: 'a RapidAPI key',
+		regex: /\b[0-9a-f]{20,60}jsn[0-9a-f]{8,}\b/g
+	},
+	{
+		// A dev sign-in bypass passed as `?dev=<secret>`, and magic links arrive
+		// as `?token=`/`?otp=`. The generic sensitive-query-param rule keys on
+		// key/token/secret/... and so misses `dev`, `otp` and `magic`.
+		id: 'auth-query-param',
+		description: 'a credential in a dev / otp / magic-link query parameter',
+		regex: /[?&][\w.-]*(?:otp|magic|dev|session|bearer)[\w.-]*=([^&\s"'`]+)/gi,
+		group: 1,
+		validate: (value) => isLiveSecret(value, { minEntropy: 3.0 })
+	},
 	{
 		id: 'private-key',
 		description: 'a PEM private-key block',
@@ -289,9 +378,14 @@ const RULES = [
 		regex: /\b(?:gh[pousr]_[A-Za-z0-9]{36,255}|github_pat_[0-9A-Za-z_]{22,255})\b/g
 	},
 	{
+		// Every real Slack token is prefix + numeric team/app id + secret
+		// (xoxb-2468135790-2468135791-AbCdEf…), with a short version marker in
+		// front of the id on a legacy workspace token (xoxa-2-24681357…).
+		// Matching any word run instead reads a test double like
+		// `xoxb-slack-token` as a live token.
 		id: 'slack-token',
 		description: 'a Slack token',
-		regex: /\bxox[baprs]-[0-9A-Za-z-]{10,}\b/g
+		regex: /\bxox[baprs]-(?:[0-9]{1,3}-)?[0-9]{6,}-[0-9A-Za-z-]{8,}\b/g
 	},
 	{
 		id: 'stripe-secret-key',
@@ -339,12 +433,20 @@ const RULES = [
 		validate: (password) => !isPlaceholderValue(password)
 	},
 	{
+		// A presigned URL's signature is exempt by name, not by dropping
+		// `signature` from the rule: it is a per-request HMAC derived from a key
+		// that isn't in the URL, the same reason CREDENTIAL_WORDS leaves
+		// `x-moad-signature` out, while a `?signature=` on some other callback
+		// URL has no such guarantee and is still reported. The reusable half of
+		// a presigned URL is caught either way — X-Amz-Credential carries the
+		// access key id, which aws-access-key-id matches on its own.
 		id: 'sensitive-query-param',
 		description: 'a secret in a URL query parameter',
 		regex:
 			/[?&][\w.-]*(?:key|token|secret|password|passwd|pwd|auth|credential|signature)[\w.-]*=([^&\s"'`]+)/gi,
 		group: 1,
-		validate: (value) => isLiveSecret(value, { minEntropy: 3.0 })
+		validate: (value, match) =>
+			!PRESIGNED_SIGNATURE_PARAM.test(match[0]) && isLiveSecret(value, { minEntropy: 3.0 })
 	},
 	{
 		id: 'auth-header',
@@ -362,7 +464,10 @@ const RULES = [
 		description: 'a secret-looking value assigned to a sensitively-named key',
 		regex: /([A-Za-z_][A-Za-z0-9_.-]{2,40})\s*[:=]\s*['"`]?([A-Za-z0-9._+/=~-]{20,})['"`]?/g,
 		group: 2,
-		validate: (value, match) => isCredentialKey(match[1]) && looksLikeSecretValue(value)
+		validate: (value, match) =>
+			isCredentialKey(match[1]) &&
+			!(isStorageField(match[1]) && isObjectKeyPath(value)) &&
+			looksLikeSecretValue(value)
 	}
 ]
 
@@ -422,9 +527,9 @@ function globToRegExp(glob) {
 	const escaped = glob
 		.trim()
 		.replace(/[.+^${}()|[\]\\]/g, '\\$&')
-		.replace(/\*\*/g, ' ')
+		.replace(/\*\*/g, '\0')
 		.replace(/\*/g, '[^/]*')
-		.replace(/ /g, '.*')
+		.replace(/\0/g, '.*')
 		.replace(/\?/g, '.')
 	return new RegExp(`(^|/)${escaped}$`)
 }
@@ -485,7 +590,10 @@ export function run({ mode, paths = [] }) {
 	const findings = []
 	for (const [path, text] of collect(mode, paths)) {
 		if (text == null || isSkipped(path, allowlist)) continue
-		if (text.length > MAX_BYTES || isProbablyBinary(text)) continue
+		// Session transcripts are routinely over 1MB and are exactly where a
+		// credential lands, so the generated-bundle size cap does not apply to them.
+		const isTranscript = /(^|\/)\.(claude|codex)-logs\//.test(path)
+		if ((!isTranscript && text.length > MAX_BYTES) || isProbablyBinary(text)) continue
 		for (const finding of scanText(text)) findings.push({ path, ...finding })
 	}
 	return findings
@@ -527,6 +635,6 @@ function main() {
 	process.exit(1)
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (process.argv[1] != null && import.meta.url === pathToFileURL(process.argv[1]).href) {
 	main()
 }
