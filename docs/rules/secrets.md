@@ -27,7 +27,14 @@ It flags connection strings with an inline password, provider-format keys
 private keys, and a high-entropy value assigned to a credential-named key
 (`API_KEY=…`). It deliberately allows the placeholder shapes the repo carries
 on purpose — `postgresql://user:password@host`, `Bearer $CRON_SECRET`,
-`sk-…` written as prose.
+`sk-…` written as prose, a path assigned to a field that names a storage
+location (`videoObjectKey = 'clips/123.mp4'` — a credential-named field like
+`API_KEY` never gets that exemption, whatever its value looks like), and a
+presigned `X-Amz-Signature` (a per-request HMAC, not a reusable credential —
+the access key id beside it in `X-Amz-Credential` is still flagged). It does
+not try to infer a fixture from words like `test`, `fake` or `value` in the
+value: a staging password reads that way too. A deliberate fake says so with
+`allowlist secret` on the line.
 
 This is a backstop, exactly like `redact()` in the logger
 (`docs/rules/logging.md`) — that one scrubs the same shapes out of structured
